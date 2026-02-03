@@ -140,15 +140,17 @@ class MercuryConnection private constructor() {
     }
 
     private val client = OkHttpClient()
-    private val request = Request.Builder().url("https://apresolve.spotify.com/").build()
+    private val request = Request.Builder().url("https://apresolve.spotify.com/?type=accesspoint").build()
     private val mutex = Mutex()
     private suspend fun open() = mutex.withLock {
         withContext(Dispatchers.IO) {
-            val address = client.newCall(request).await().use { response ->
-                response.body.string()
-                    .substringAfter("[").substringBefore("]").split(",")
-                    .map { it.trim().removeSurrounding("\"") }.random()
-            }
+            val address = runCatching {
+                client.newCall(request).await().use { response ->
+                    response.body.string()
+                        .substringAfter("[").substringBefore("]").split(",")
+                        .map { it.trim().removeSurrounding("\"") }.random()
+                }
+            }.getOrElse { "ap-gae2.spotify.com:443" } // Fallback to a known working AP
             socket = address.let { s ->
                 val split = s.split(":".toRegex()).dropLastWhile { it.isEmpty() }
                 Socket(split[0], split[1].toInt())

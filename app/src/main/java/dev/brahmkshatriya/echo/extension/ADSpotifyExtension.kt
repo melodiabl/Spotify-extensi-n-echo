@@ -27,13 +27,16 @@ class ADSpotifyExtension : SpotifyExtension() {
     private val client = OkHttpClient()
 
     override suspend fun getKey(accessToken: String, fileId: String): ByteArray {
-        val request = Request.Builder()
-        request.url(Unplayplay.getPlayPlayUrl(fileId))
-        request.addHeader("Authorization", "Bearer $accessToken")
-        request.post(playPlayRequest(Unplayplay.token).toRequestBody())
-        val raw = client.newCall(request.build()).await()
-        if(!raw.isSuccessful) throw Exception("Error ${raw.code}: ${raw.message}")
-        val key = Unplayplay.deobfuscateKey(fileId.hexToByteArray(), playPlayResponse(raw.body.bytes()))
-        return key
+        return runCatching {
+            val request = Request.Builder()
+            request.url(Unplayplay.getPlayPlayUrl(fileId))
+            request.addHeader("Authorization", "Bearer $accessToken")
+            request.post(playPlayRequest(Unplayplay.token).toRequestBody())
+            val raw = client.newCall(request.build()).await()
+            if(!raw.isSuccessful) throw Exception("Error ${raw.code}: ${raw.message}")
+            Unplayplay.deobfuscateKey(fileId.hexToByteArray(), playPlayResponse(raw.body.bytes()))
+        }.getOrElse {
+            super.getKey(accessToken, fileId)
+        }
     }
 }

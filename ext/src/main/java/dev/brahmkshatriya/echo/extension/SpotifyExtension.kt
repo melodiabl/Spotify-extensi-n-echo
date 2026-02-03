@@ -44,6 +44,7 @@ import dev.brahmkshatriya.echo.common.settings.SettingSwitch
 import dev.brahmkshatriya.echo.common.settings.Settings
 import dev.brahmkshatriya.echo.extension.spotify.Queries
 import dev.brahmkshatriya.echo.extension.spotify.SpotifyApi
+import dev.brahmkshatriya.echo.extension.spotify.Base62
 import dev.brahmkshatriya.echo.extension.spotify.SpotifyApi.Companion.userAgent
 import dev.brahmkshatriya.echo.extension.spotify.mercury.MercuryConnection
 import dev.brahmkshatriya.echo.extension.spotify.mercury.StoredToken
@@ -73,6 +74,7 @@ import java.io.File
 import java.io.InputStream
 import java.math.BigInteger
 import java.net.URLDecoder
+import kotlin.text.hexToByteArray
 import javax.crypto.Cipher
 import javax.crypto.CipherInputStream
 import javax.crypto.spec.IvParameterSpec
@@ -229,7 +231,7 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
                 val format = Metadata4Track.Format.valueOf(streamable.extras["format"]!!)
                 return when (format) {
                     OGG_VORBIS_320, OGG_VORBIS_160, OGG_VORBIS_96 -> oggStream(streamable)
-                    MP4_256, MP4_128 -> widevineStream(streamable)
+                    MP4_256, MP4_128, Metadata4Track.Format.MP4_256_DUAL, Metadata4Track.Format.MP4_128_DUAL -> widevineStream(streamable)
                     else -> throw ClientException.NotSupported(format.name)
                 }
             }
@@ -652,14 +654,15 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
 
     private suspend fun widevineStream(streamable: Streamable): Streamable.Media.Server {
         val accessToken = api.getWebAccessToken()
-        val url = queries.storageResolve(streamable.id).json.cdnUrl.first()
-        val time = "time=${System.currentTimeMillis()}"
+        val storage = queries.storageResolve(streamable.id).json
+        val url = storage.cdnUrl.firstOrNull() 
+            ?: throw Exception("No CDN URL found for ${streamable.id}")
+        
         val decryption = Streamable.Decryption.Widevine(
-            "https://spclient.wg.spotify.com/widevine-license/v1/audio/license?$time"
+            "https://spclient.wg.spotify.com/widevine-license/v1/audio/license"
                 .toGetRequest(
                     mapOf(
                         "Authorization" to "Bearer $accessToken",
-                        "Origin" to "https://open.spotify.com",
                     )
                 ),
             true
@@ -674,8 +677,13 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
     var lastFetched = 0L
     val mutex = Mutex()
 
-    open suspend fun getKey(accessToken: String, fileId: String): ByteArray =
-        throw IllegalStateException()
+    open suspend fun getKey(accessToken: String, fileId: String): ByteArray {
+        // This is a fallback, but we need the gid to get the key from Mercury.
+        // If we don't have it, we might have to fetch metadata first.
+        // For now, let's assume the fileId is the gid if they are the same length, 
+        // or throw a better error.
+        throw Exception("Internal API: GID required for Mercury key request")
+    }
 
     private suspend fun oggStream(streamable: Streamable): Streamable.Media {
         val fileId = streamable.id

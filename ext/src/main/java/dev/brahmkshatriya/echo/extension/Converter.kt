@@ -732,8 +732,8 @@ fun Metadata4Track.Format.show(
     Metadata4Track.Format.OGG_VORBIS_320 -> hasPremium && supportsPlayPlay
     Metadata4Track.Format.OGG_VORBIS_160 -> supportsPlayPlay
     Metadata4Track.Format.OGG_VORBIS_96 -> supportsPlayPlay
-    Metadata4Track.Format.MP4_256_DUAL -> false
-    Metadata4Track.Format.MP4_128_DUAL -> false
+    Metadata4Track.Format.MP4_256_DUAL -> hasPremium && showWidevineStreams
+    Metadata4Track.Format.MP4_128_DUAL -> showWidevineStreams
     Metadata4Track.Format.MP4_256 -> hasPremium && showWidevineStreams
     Metadata4Track.Format.MP4_128 -> showWidevineStreams
     Metadata4Track.Format.AAC_24 -> false

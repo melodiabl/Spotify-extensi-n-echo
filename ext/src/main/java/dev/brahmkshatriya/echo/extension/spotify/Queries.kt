@@ -246,7 +246,7 @@ class Queries(
     }
 
     suspend fun storageResolve(id: String) = api.clientQuery<StorageResolve>(
-        "storage-resolve/v2/files/audio/interactive/10/$id?version=10000000&product=9&platform=39&alt=json"
+        "storage-resolve/v2/files/audio/interactive/10/$id?version=10000000&product=9&platform=WEB_PLAYER&alt=json"
     )
 
     suspend fun colorLyrics(id: String, img: String) = api.clientQuery<ColorLyrics>(
