@@ -1,0 +1,85 @@
+server:
+  port: 2333
+  address: 0.0.0.0
+
+lavalink:
+  plugins:
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.17.0"
+    - dependency: "com.github.topi888.lavasrc:lavasrc-plugin:4.8.1"
+  server:
+    password: "youshallnotpass" # Cambia esto por una contraseña segura
+    sources:
+      youtube: false # Desactivar el nativo (v4 lo hace por defecto si usas el plugin)
+      bandcamp: true
+      soundcloud: true
+      twitch: true
+      vimeo: true
+      http: true
+      local: false
+    filters:
+      volume: true
+      equalizer: true
+      karaoke: true
+      timescale: true
+      tremolo: true
+      vibrato: true
+      distortion: true
+      rotation: true
+      channelMix: true
+      lowPass: true
+    bufferDurationMs: 400
+    frameBufferDurationMs: 5000
+    opusEncodingQuality: 10
+    resamplingQuality: LOW
+    trackStuckThresholdMs: 10000
+    useSeekGhosting: true
+    youtubePlaylistLoadLimit: 6
+    playerUpdateInterval: 5
+    youtubeSearchEnabled: true
+    soundcloudSearchEnabled: true
+    gc-warnings: false
+
+plugins:
+  youtube:
+    enabled: true
+    allowDirectVideoIds: true
+    allowSearch: true
+    clients:
+      - MUSIC
+      - ANDROID_TESTSUITE
+      - WEB
+      - TVHTML5EMBEDDED
+    # POTOKEN ES CRUCIAL: Debes obtenerlo manualmente
+    # poToken: "TU_PO_TOKEN"
+    # visitorData: "TU_VISITOR_DATA"
+
+  lavasrc:
+    providers:
+      - "dzisrc:%ISRC%"
+      - "spsearch:%QUERY%"
+    sources:
+      spotify: true
+      applemusic: true
+      deezer: true
+    spotify:
+      clientId: "TU_CLIENT_ID"
+      clientSecret: "TU_CLIENT_SECRET"
+      countryCode: "US"
+      playlistLoadLimit: 6
+      albumLoadLimit: 6
+
+logging:
+  file:
+    path: ./logs/lavalink.log
+  level:
+    root: INFO
+    lavalink: INFO
+
+# CONFIGURACIÓN PARA CONTABO (IPv6)
+# Contabo suele dar un /64. Necesitas configurar la rotación para evitar bloqueos.
+# Reemplaza 'tu:ipv6:bloque::/64' con tu bloque real.
+# ratelimit:
+#   ipBlocks: ["tu:ipv6:bloque::/64"]
+#   strategy: "RotateOnBan"
+#   searchTriggersFail: true
+#   retryLimit: 100

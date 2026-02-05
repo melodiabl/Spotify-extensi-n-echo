@@ -1,0 +1,30 @@
+[
+  {
+    "name": "Jirayu (Public)",
+    "host": "lavalink.jirayu.net",
+    "port": 443,
+    "password": "youshallnotpass",
+    "secure": true
+  },
+  {
+    "name": "Serenetia (Public)",
+    "host": "lavalinkv4.serenetia.com",
+    "port": 443,
+    "password": "https://dsc.gg/ajidevserver",
+    "secure": true
+  },
+  {
+    "name": "Lava-V3 (Public)",
+    "host": "lava-v3.millohost.my.id",
+    "port": 443,
+    "password": "https://discord.gg/mjS5J2K3ep",
+    "secure": true
+  },
+  {
+    "name": "Mi Servidor Contabo",
+    "host": "207.180.228.137",
+    "port": 2333,
+    "password": "youshallnotpass",
+    "secure": false
+  }
+]
