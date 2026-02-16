@@ -1,102 +1,97 @@
 package dev.brahmkshatriya.echo.extension.spotify
 
 import dev.brahmkshatriya.echo.common.helpers.ContinuationCallback.Companion.await
-import dev.brahmkshatriya.echo.extension.spotify.SpotifyApi.Companion.userAgent
-import dev.brahmkshatriya.echo.extension.spotify.TOTP.convertToHex
 import kotlinx.serialization.Serializable
-import okhttp3.OkHttpClient
+import okhttp3.Credentials
+import okhttp3.FormBody
 import okhttp3.Request
-import kotlin.io.encoding.ExperimentalEncodingApi
+import java.io.File
 
-class TokenManagerWeb(
-    private val api: SpotifyApi,
-) {
-    private val json = api.json
-    val httpClient = OkHttpClient.Builder().addInterceptor {
-        val req = it.request().newBuilder()
-        val cookie = api.cookie
-        if (cookie != null) req.addHeader("Cookie", cookie)
-        req.addHeader(userAgent.first, userAgent.second)
-        req.addHeader("Referer", "https://open.spotify.com/")
-        it.proceed(req.build())
-    }.build()
+class TokenManagerWeb(private val api: SpotifyApi, private val clientId: String, private val clientSecret: String) {
 
     var accessToken: String? = null
-    private var tokenExpiration: Long = 0
-
-    private suspend fun createAccessToken(): String {
-        val req = Request.Builder().url(getUrl())
-        val res = httpClient.newCall(req.build()).await()
-        val body = res.body.string()
-        val token = runCatching { json.decode<TokenResponse>(body) }.getOrElse {
-            throw runCatching { json.decode<ErrorMessage>(body).error }.getOrElse {
-                Exception(body.ifEmpty { "Token Code ${res.code}" })
-            }
-        }
-
-        accessToken = token.accessToken
-        tokenExpiration = token.accessTokenExpirationTimestampMs - 5 * 60 * 1000
-        return accessToken!!
-    }
-
-    @OptIn(ExperimentalStdlibApi::class)
-    private suspend fun getUrl(): String {
-        val (secret, version) = getDataFromSite()
-        val time = System.currentTimeMillis()
-        val totp = TOTP.generateTOTP(secret, (time / 30000).toHexString().uppercase())
-        val url =
-            "https://open.spotify.com/api/token?reason=init&productType=web-player&totp=${totp}&totpServer=${totp}&totpVer=$version"
-        return url
-    }
-
-    private val secretsUrl =
-        "https://raw.githubusercontent.com/itsmechinmoy/echo-extensions/refs/heads/main/noidea.txt"
-
-    @OptIn(ExperimentalEncodingApi::class)
-    private suspend fun getDataFromSite(): Secret {
-        val string =
-            httpClient.newCall(Request.Builder().url(secretsUrl).build()).await().body.string()
-        val (secret, version) = json.decode<Secret>(string)
-        val hex = convertToHex(secret)
-        return Secret(hex, version)
-    }
-
-    suspend fun getToken() =
-        if (accessToken == null || !isTokenWorking(tokenExpiration)) createAccessToken()
-        else accessToken!!
+    var refreshToken: String? = null
+    var tokenExpiration: Long = 0
 
     fun clear() {
         accessToken = null
+        refreshToken = null
         tokenExpiration = 0
     }
 
-    private fun isTokenWorking(expiry: Long): Boolean {
-        return (System.currentTimeMillis() < expiry)
+    suspend fun getToken(): String {
+        if (accessToken == null || tokenExpiration < System.currentTimeMillis()) {
+            if (refreshToken != null) {
+                refreshAccessToken()
+            } else {
+                throw Error("No refresh token available. User needs to log in.")
+            }
+        }
+        return accessToken!!
     }
 
+    suspend fun getAccessTokenFromCode(code: String, codeVerifier: String, redirectUri: String): TokenResponse {
+        val requestBody = FormBody.Builder()
+            .add("grant_type", "authorization_code")
+            .add("code", code)
+            .add("redirect_uri", redirectUri)
+            .add("client_id", clientId)
+            .add("code_verifier", codeVerifier)
+            .build()
 
-    @Serializable
-    data class Secret(
-        val secret: String,
-        val version: Int,
-    )
+        val request = Request.Builder()
+            .url("https://accounts.spotify.com/api/token")
+            .post(requestBody)
+            .addHeader("Authorization", Credentials.basic(clientId, clientSecret))
+            .build()
+
+        val response = api.client.newCall(request).await()
+        if (!response.isSuccessful) {
+            throw Error("Failed to get access token: ${response.code} ${response.message}")
+        }
+        val responseBody = response.body.string()
+        val tokenResponse = api.json.decode<TokenResponse>(responseBody)
+
+        accessToken = tokenResponse.access_token
+        refreshToken = tokenResponse.refresh_token
+        tokenExpiration = System.currentTimeMillis() + (tokenResponse.expires_in * 1000) - (5 * 60 * 1000) // 5 minutes buffer
+
+        return tokenResponse
+    }
+
+    private suspend fun refreshAccessToken() {
+        val requestBody = FormBody.Builder()
+            .add("grant_type", "refresh_token")
+            .add("refresh_token", refreshToken!!)
+            .add("client_id", clientId)
+            .build()
+
+        val request = Request.Builder()
+            .url("https://accounts.spotify.com/api/token")
+            .post(requestBody)
+            .addHeader("Authorization", Credentials.basic(clientId, clientSecret))
+            .build()
+
+        val response = api.client.newCall(request).await()
+        if (!response.isSuccessful) {
+            throw Error("Failed to refresh access token: ${response.code} ${response.message}")
+        }
+        val responseBody = response.body.string()
+        val tokenResponse = api.json.decode<TokenResponse>(responseBody)
+
+        accessToken = tokenResponse.access_token
+        refreshToken = tokenResponse.refresh_token ?: refreshToken // Refresh token might not be returned
+        tokenExpiration = System.currentTimeMillis() + (tokenResponse.expires_in * 1000) - (5 * 60 * 1000)
+    }
 
     @Serializable
     data class TokenResponse(
-        val isAnonymous: Boolean,
-        val accessTokenExpirationTimestampMs: Long,
-        val clientId: String,
-        val accessToken: String,
+        val access_token: String,
+        val token_type: String,
+        val expires_in: Long,
+        val refresh_token: String? = null,
+        val scope: String? = null
     )
 
-    @Serializable
-    data class ErrorMessage(
-        val error: Error,
-    )
-
-    @Serializable
-    data class Error(
-        val code: Int,
-        override val message: String,
-    ) : Exception(message)
+    class Error(message: String) : Exception(message)
 }

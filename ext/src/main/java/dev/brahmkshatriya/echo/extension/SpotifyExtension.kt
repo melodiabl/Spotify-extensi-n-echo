@@ -40,14 +40,14 @@ import dev.brahmkshatriya.echo.common.models.Streamable.Source.Companion.toSourc
 import dev.brahmkshatriya.echo.common.models.Tab
 import dev.brahmkshatriya.echo.common.models.Track
 import dev.brahmkshatriya.echo.common.models.User
+import dev.brahmkshatriya.echo.common.settings.SettingString
 import dev.brahmkshatriya.echo.common.settings.SettingSwitch
 import dev.brahmkshatriya.echo.common.settings.Settings
+import dev.brahmkshatriya.echo.extension.spotify.Base62
 import dev.brahmkshatriya.echo.extension.spotify.Queries
 import dev.brahmkshatriya.echo.extension.spotify.SpotifyApi
-import dev.brahmkshatriya.echo.extension.spotify.Base62
 import dev.brahmkshatriya.echo.extension.spotify.SpotifyApi.Companion.userAgent
 import dev.brahmkshatriya.echo.extension.spotify.mercury.MercuryConnection
-import dev.brahmkshatriya.echo.extension.spotify.mercury.StoredToken
 import dev.brahmkshatriya.echo.extension.spotify.models.AccountAttributes
 import dev.brahmkshatriya.echo.extension.spotify.models.ArtistOverview
 import dev.brahmkshatriya.echo.extension.spotify.models.GetAlbum
@@ -74,18 +74,33 @@ import java.io.File
 import java.io.InputStream
 import java.math.BigInteger
 import java.net.URLDecoder
-import kotlin.text.hexToByteArray
+import java.security.MessageDigest
+import java.security.SecureRandom
 import javax.crypto.Cipher
 import javax.crypto.CipherInputStream
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import kotlin.io.encoding.Base64
+import kotlin.io.encoding.ExperimentalEncodingApi
 
-open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
+open class SpotifyExtension(val clientId: String, val clientSecret: String) : ExtensionClient, LoginClient.WebView,
     SearchFeedClient, HomeFeedClient, LibraryFeedClient, LyricsClient, ShareClient,
     TrackClient, LikeClient, RadioClient, SaveClient,
     AlbumClient, PlaylistClient, ArtistClient, FollowClient, PlaylistEditClient {
 
     override suspend fun getSettingItems() = listOf(
+        SettingString(
+            "Spotify Client ID",
+            "spotifyClientId",
+            "Your Spotify Application Client ID",
+            clientId
+        ),
+        SettingString(
+            "Spotify Client Secret",
+            "spotifyClientSecret",
+            "Your Spotify Application Client Secret",
+            clientSecret
+        ),
         SettingSwitch(
             "Show Canvas",
             "show_canvas",
@@ -109,36 +124,49 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
     }
 
     open val filesDir = File("spotify")
-    val api by lazy { SpotifyApi(filesDir) }
+    val api by lazy { SpotifyApi(filesDir, clientId, clientSecret) }
     val queries by lazy { Queries(api) }
 
+    @OptIn(ExperimentalEncodingApi::class)
     override val webViewRequest = object : WebViewRequest.Cookie<List<User>> {
-        override val dontCache = true
-        override val initialUrl =
-            "https://accounts.spotify.com/en/login?allow_password=1".toGetRequest(mapOf(userAgent))
-        override val stopUrlRegex =
-            Regex("(https://accounts\\.spotify\\.com/.{2}/status.*)|(https://open\\.spotify\\.com)")
+        private val secureRandom = SecureRandom()
+        private val codeVerifierBytes = ByteArray(32).apply { secureRandom.nextBytes(this) }
+        private val codeVerifier = Base64.UrlSafe.encode(codeVerifierBytes).substringBefore("=")
+        private val codeChallenge = Base64.UrlSafe.encode(MessageDigest.getInstance("SHA-256").digest(codeVerifier.toByteArray())).substringBefore("=")
 
-        val emailRegex = Regex("remember=([^;]+)")
+        private val redirectUri = "https://localhost:8080/callback"
+        private val scopes = "user-read-private user-read-email user-library-read user-library-modify playlist-read-private playlist-modify-private playlist-modify-public streaming"
+
+        override val initialUrl =
+            "https://accounts.spotify.com/authorize?response_type=code&client_id=$clientId&scope=$scopes&redirect_uri=$redirectUri&code_challenge_method=S256&code_challenge=$codeChallenge".toGetRequest(mapOf(userAgent))
+        override val stopUrlRegex =
+            Regex("$redirectUri\\?code=.*")
+
         override suspend fun onStop(url: NetworkRequest, cookie: String): List<User> {
-            if (!cookie.contains("sp_dc")) throw Exception("Token not found")
-            val api = SpotifyApi(filesDir)
-            api.setCookie(cookie)
-            val email = emailRegex.find(cookie)?.groups?.get(1)?.value?.let {
-                URLDecoder.decode(it, "UTF-8")
-            }
-            val user = Queries(api).profileAttributes().json.toUser().copy(
-                extras = mapOf("cookie" to cookie),
-                subtitle = email
+            val code = url.url.substringAfter("code=").substringBefore("&")
+            val tokenResponse = api.web.getAccessTokenFromCode(code, codeVerifier, redirectUri)
+            api.setCookie(cookie) // Keep the cookie for other web-based calls if needed
+            api.web.accessToken = tokenResponse.access_token
+            api.web.refreshToken = tokenResponse.refresh_token
+            api.web.tokenExpiration = System.currentTimeMillis() + (tokenResponse.expires_in * 1000) - (5 * 60 * 1000)
+
+            val userProfile = queries.profileAttributes().json.toUser().copy(
+                extras = mapOf(
+                    "cookie" to cookie,
+                    "accessToken" to tokenResponse.access_token,
+                    "refreshToken" to (tokenResponse.refresh_token ?: ""),
+                    "tokenExpiration" to api.web.tokenExpiration.toString()
+                )
             )
-            return listOf(user)
+            return listOf(userProfile)
         }
     }
 
     override fun setLoginUser(user: User?) {
-        val cookie = if (user == null) null
-        else user.extras["cookie"] ?: throw ClientException.Unauthorized(user.id)
-        api.setCookie(cookie)
+        api.setCookie(user?.extras?.get("cookie"))
+        api.web.accessToken = user?.extras?.get("accessToken")
+        api.web.refreshToken = user?.extras?.get("refreshToken")
+        api.web.tokenExpiration = user?.extras?.get("tokenExpiration")?.toLong() ?: 0
         api.setUser(user?.id)
         this.user = user
         this.product = null
@@ -192,389 +220,115 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
                 }
 
                 "EPISODES" -> paged {
-                    queries.searchFullEpisodes(query, it).json.data.searchV2.episodes
+                    queries.searchEpisode(query, it).json.data.searchV2.episodes
+                        .toItemShelves(cropCovers)
+                }
+
+                "SHOWS" -> paged {
+                    queries.searchShow(query, it).json.data.searchV2.shows
                         .toItemShelves(cropCovers)
                 }
 
                 "USERS" -> paged {
-                    queries.searchUser(query, it).json.data.searchV2.users.toItemShelves(cropCovers)
+                    queries.searchUser(query, it).json.data.searchV2.users
+                        .toItemShelves(cropCovers)
                 }
 
-                else -> shelves
-            }.toFeedData()
-        }
-    }
-
-    override suspend fun loadFeed(track: Track) = PagedData.Single {
-        val (union, rec) = coroutineScope {
-            val a = async { queries.getTrack(track.id).json.data.trackUnion }
-            val b = queries.internalLinkRecommenderTrack(track.id).json.data.seoRecommendedTrack
-            a.await() to b
-        }
-        val list =
-            rec.items.mapNotNull { it.data?.toTrack(cropCovers) }.takeIf { it.isNotEmpty() }?.let {
-                listOf(Shelf.Lists.Tracks("${track.id}_more", "More like this", it))
-            } ?: emptyList<Shelf>()
-        val first =
-            union.firstArtist?.items?.firstOrNull()?.toShelves(queries, cropCovers) ?: emptyList()
-        val other =
-            union.otherArtists?.items.orEmpty().map { it.toShelves(queries, cropCovers) }.flatten()
-        list + first + other
-    }.toFeed()
-
-    override suspend fun loadStreamableMedia(
-        streamable: Streamable, isDownload: Boolean,
-    ): Streamable.Media {
-        return when (streamable.type) {
-            Streamable.MediaType.Server -> {
-                api.cookie ?: throw ClientException.LoginRequired()
-                val format = Metadata4Track.Format.valueOf(streamable.extras["format"]!!)
-                return when (format) {
-                    OGG_VORBIS_320, OGG_VORBIS_160, OGG_VORBIS_96 -> oggStream(streamable)
-                    MP4_256, MP4_128, Metadata4Track.Format.MP4_256_DUAL, Metadata4Track.Format.MP4_128_DUAL -> widevineStream(streamable)
-                    else -> throw ClientException.NotSupported(format.name)
-                }
+                else -> shelves.toFeedData()
             }
-
-            Streamable.MediaType.Background ->
-                Streamable.Media.Background(streamable.id.toGetRequest())
-
-            else -> throw IllegalStateException("Unsupported Streamable : $streamable")
         }
     }
 
-    open val showWidevineStreams = false
-
-    override suspend fun loadTrack(track: Track, isDownload: Boolean): Track = coroutineScope {
-        val hasPremium = hasPremium()
-        val canvas =
-            if (showCanvas) async { queries.canvas(track.id).json.toStreamable() } else null
-        queries.metadata4Track(track.id).json.toTrack(
-            hasPremium, hasPremium, showWidevineStreams, canvas?.await()
-        ).copy(
-            isExplicit = track.isExplicit
-        )
-    }
-
-    private suspend fun createRadio(id: String): Radio {
-        val radioId = queries.seedToPlaylist(id).json.mediaItems.first().uri
-        return queries.fetchPlaylist(radioId).json.data.playlistV2.toRadio(cropCovers)!!
-    }
-
-    override suspend fun radio(item: EchoMediaItem, context: EchoMediaItem?) = createRadio(item.id)
-    override suspend fun loadRadio(radio: Radio) = radio
-    override suspend fun loadTracks(radio: Radio) = loadPlaylistTracks(radio.id, true).toFeed()
-
-    override suspend fun loadPlaylist(playlist: Playlist) =
-        when (val type = playlist.id.substringAfter(":").substringBefore(":")) {
-            "playlist" -> {
-                val new =
-                    queries.fetchPlaylist(playlist.id).json.data.playlistV2.toPlaylist(cropCovers)!!
-                new.copy(
-                    isEditable = runCatching {
-                        val id = getPlaylistId(new)
-                        queries.editPlaylistMetadata(id, new.title, new.description).json
-                            .capabilities?.canEditItems
-                    }.getOrNull() ?: false
-                )
-            }
-
-            "collection" -> {
-                val totalSongs = if (playlist.trackCount == null)
-                    queries.fetchLibraryTracks(0).json.data.me.library.tracks.totalCount
-                else playlist.trackCount
-
-                likedPlaylist.copy(
-                    cover = "https://misc.scdn.co/liked-songs/liked-songs-640.jpg".toImageHolder(),
-                    trackCount = totalSongs
-                )
-            }
-
-            else -> throw ClientException.NotSupported("Unsupported playlist type: $type")
-        }
-
-    private fun loadPlaylistTracks(id: String, skipFirst: Boolean = false) = paged { offset ->
-        val content = queries.fetchPlaylistContent(id, offset).json.data.playlistV2.content!!
-        val tracks = content.items!!.mapNotNull {
-            val track = it.itemV2?.data?.toTrack(cropCovers, added = it.addedAt?.toDate())
-                ?: return@mapNotNull null
-            if (it.uid != null) track.copy(extras = mapOf("uid" to it.uid)) else track
-        }.let {
-            if (skipFirst && offset == 0) it.drop(1) else it
-        }
-        val page = content.pagingInfo!!
-        val next = page.offset!! + page.limit!!
-        tracks to if (content.totalCount!! > next) next else null
-    }
-
-    private fun loadLikedTracks() = paged { offset ->
-        val content = queries.fetchLibraryTracks(offset).json.data.me.library.tracks
-        val tracks = content.items.map {
-            it.track.data?.toTrack(
-                cropCovers,
-                url = it.track.uri,
-                added = it.addedAt?.toDate()
-            )!!
-        }
-        val page = content.pagingInfo!!
-        val next = page.offset!! + page.limit!!
-        tracks to if (content.totalCount!! > next) next else null
-    }
-
-    override suspend fun loadTracks(playlist: Playlist) =
-        when (val type = playlist.id.substringAfter(":").substringBefore(":")) {
-            "playlist" -> loadPlaylistTracks(playlist.id).toFeed()
-            "collection" -> loadLikedTracks().toFeed()
-            else -> throw ClientException.NotSupported("Unsupported playlist type: $type")
-        }
-
-    override suspend fun moveTrackInPlaylist(
-        playlist: Playlist,
-        tracks: List<Track>,
-        fromIndex: Int,
-        toIndex: Int,
-    ) {
-        getPlaylistId(playlist)
-        val uid = tracks[fromIndex].extras["uid"]!!
-        val before = if (fromIndex - toIndex > 0) 0 else 1
-        val fromUid = tracks.getOrNull(toIndex + before)?.extras?.get("uid")
-        queries.moveItemsInPlaylist(playlist.id, uid, fromUid)
-    }
-
-    override suspend fun removeTracksFromPlaylist(
-        playlist: Playlist,
-        tracks: List<Track>,
-        indexes: List<Int>,
-    ) {
-        if (api.cookie == null) throw ClientException.LoginRequired()
-        when (val type = playlist.id.substringAfter(":").substringBefore(":")) {
-            "playlist" -> {
-                val uids = indexes.map { tracks[it].extras["uid"]!! }.toTypedArray()
-                queries.removeFromPlaylist(playlist.id, *uids)
-            }
-
-            "collection" -> {
-                val uris = indexes.map { tracks[it].id }.toTypedArray()
-                queries.removeFromLibrary(*uris)
-            }
-
-            else -> throw ClientException.NotSupported("Unsupported playlist type: $type")
-        }
-    }
-
-    override suspend fun addTracksToPlaylist(
-        playlist: Playlist,
-        tracks: List<Track>,
-        index: Int,
-        new: List<Track>,
-    ) {
-        if (api.cookie == null) throw ClientException.LoginRequired()
-        when (val type = playlist.id.substringAfter(":").substringBefore(":")) {
-            "playlist" -> {
-                val uris = new.map { it.id }.toTypedArray()
-                val fromUid = tracks.getOrNull(index)?.extras?.get("uid")
-                queries.addToPlaylist(playlist.id, fromUid, *uris)
-            }
-
-            "collection" -> {
-                val uris = new.map { it.id }.toTypedArray()
-                queries.addToLibrary(*uris)
-            }
-
-            else -> throw ClientException.NotSupported("Unsupported playlist type: $type")
-        }
-
-    }
-
-    override suspend fun createPlaylist(title: String, description: String?): Playlist {
-        if (api.cookie == null) throw ClientException.LoginRequired()
-        val uri = queries.createPlaylist(title, description).json.uri
-        val userId = getCurrentUser()!!.id.substringAfter("spotify:user:")
-        queries.playlistToLibrary(userId, uri)
-        return loadPlaylist(Playlist(uri, title, true))
-    }
-
-    private fun getPlaylistId(playlist: Playlist): String {
-        if (api.cookie == null) throw ClientException.LoginRequired()
-        if (!playlist.id.startsWith("spotify:playlist:"))
-            throw ClientException.NotSupported("Unsupported playlist type: ${playlist.id}")
-        return playlist.id.substringAfter("spotify:playlist:")
-    }
-
-    override suspend fun deletePlaylist(playlist: Playlist) {
-        getPlaylistId(playlist)
-        val userId = getCurrentUser()!!.id.substringAfter("spotify:user:")
-        queries.deletePlaylist(userId, playlist.id)
-    }
-
-    override suspend fun editPlaylistMetadata(
-        playlist: Playlist, title: String, description: String?,
-    ) {
-        val id = getPlaylistId(playlist)
-        queries.editPlaylistMetadata(id, title, description).raw
-    }
-
-    override suspend fun listEditablePlaylists(track: Track?): List<Pair<Playlist, Boolean>> {
-        return editablePlaylists(queries, track?.id, null, cropCovers).loadAll()
-    }
-
-    override suspend fun loadFeed(playlist: Playlist): Feed<Shelf>? =
-        when (playlist.id.substringAfter(":").substringBefore(":")) {
-            "playlist" -> {
-                PagedData.Single<Shelf> {
-
-                    val playlists = queries.seoRecommendedPlaylist(playlist.id).json.data
-                        .seoRecommendedPlaylist.items.mapNotNull { it.toMediaItem(cropCovers) }
-                    if (playlists.isEmpty()) return@Single emptyList()
-                    listOf(
-                        Shelf.Lists.Items(
-                            id = "${playlist.id}_more",
-                            title = "More Playlists like this",
-                            list = playlists,
-                        )
-                    )
-                }.toFeed()
-
-            }
-
-            else -> null
-        }
-
-    override suspend fun loadAlbum(album: Album): Album {
-        val res = queries.getAlbum(album.id)
-        return res.json.data.albumUnion.toAlbum(cropCovers)!!.copy(
-            extras = mapOf("raw" to res.raw)
-        )
-    }
-
-
-    override suspend fun loadFeed(album: Album): Feed<Shelf>? = when (album.type) {
-        Album.Type.Show -> null
-        Album.Type.Book -> null
-        else -> PagedData.Single {
-            val union = api.json.decode<GetAlbum>(album.extras["raw"]!!).data.albumUnion
-            union.moreAlbumsByArtist?.items.orEmpty().map {
-                it.toShelves(queries, cropCovers)
-            }.flatten()
-        }.toFeed()
-    }
-
-    override suspend fun loadTracks(album: Album) = when (album.type) {
-        Album.Type.Show -> null
-        Album.Type.Book -> null
-        else -> {
-            var next = 0L
-            paged { offset ->
-                val content =
-                    queries.queryAlbumTracks(album.id, offset).json.data.albumUnion.tracksV2!!
-                val tracks = content.items!!.map {
-                    it.track?.toTrack(cropCovers, album)!!
-                }
-                next += tracks.size
-                tracks to if (content.totalCount!! > next) next else null
-            }.toFeed()
-        }
+    private fun <T> paged(block: suspend (Int) -> Feed.Data<T>): Feed.Data<T> {
+        return PagedData.Continuous(0, 50, block)
     }
 
     override suspend fun loadHomeFeed(): Feed<Shelf> {
-        val home = queries.home(null).json.data?.home!!
-        val tabs = if (api.cookie == null) emptyList() else
-            listOf(Tab("", "All")) + home.homeChips?.toTabs()!!
-        return Feed(tabs) { tab ->
-            PagedData.Single {
-                val res = if (tab == null || tab.id == "") home
-                else queries.home(tab.id).json.data?.home!!
-                res.toShelves(queries, cropCovers)
-            }.toFeedData()
-        }
+        return queries.home().json.data.home.sectionContainer.sections.toShelves(queries, cropCovers)
+            .toFeed()
     }
 
-    override suspend fun onShare(item: EchoMediaItem): String {
-        val type = item.id.substringAfter("spotify:").substringBefore(":")
-        val id = item.id.substringAfter("spotify:$type:")
-        return "https://open.spotify.com/$type/$id"
+    override suspend fun loadLibraryFeed(user: User): Feed<Shelf> {
+        val library = queries.library(user.id).json.data.me.library
+        val shelves = mutableListOf<Shelf>()
+        shelves.add(library.toShelf(cropCovers))
+        library.playlists?.let { shelves.add(it.toShelf(cropCovers)) }
+        library.artists?.let { shelves.add(it.toShelf(cropCovers)) }
+        library.albums?.let { shelves.add(it.toShelf(cropCovers)) }
+        return shelves.toFeed()
     }
 
-    override suspend fun loadLibraryFeed(): Feed<Shelf> {
-        if (api.cookie == null) throw ClientException.LoginRequired()
-        val filters = queries.libraryV3(0).json.data?.me?.libraryV3?.availableFilters
-            ?.mapNotNull { it.name }.orEmpty()
-        val tabs = (listOf("All", "You") + filters).map { Tab(it, it) }
-        return Feed(tabs) { tab ->
-            when (tab?.id) {
-                "All", null -> pagedLibrary(queries, cropCovers = cropCovers)
-                "You" -> PagedData.Single {
-                    val top = queries.userTopContent().json.data.me.profile
+    override suspend fun loadStreamable(streamable: Streamable): Streamable {
+        val id = streamable.id.substringAfter("spotify:track:")
+        val track = queries.trackInfo(id).json
+        val hasOgg = track.hasOgg()
+        val hasMp4 = track.hasMp4()
+        val isPlayable = track.isPlayable
 
-                    val id = getCurrentUser()!!.id.substringAfter("spotify:user:")
-                    val uris = queries.recentlyPlayed(id).json.playContexts.map { it.uri }
-                    listOfNotNull(
-                        Shelf.Lists.Items(
-                            "top_artists",
-                            "Top Artist",
-                            top.topArtists?.items.orEmpty().mapNotNull {
-                                it.toMediaItem(cropCovers)
-                            }
-                        ),
-                        Shelf.Lists.Tracks(
-                            "top_tracks",
-                            "Top Tracks",
-                            top.topTracks?.items.orEmpty().mapNotNull {
-                                (it.data as Item.Track).toTrack(cropCovers)
-                            }
-                        )
-                    ) + queries.fetchEntitiesForRecentlyPlayed(uris).json.data.lookup.mapNotNull {
-                        it.data?.toMediaItem(cropCovers)?.toShelf()
-                    }
+        if (!isPlayable) throw ClientException.Unavailable("This track is not available in your region.")
+
+        val media = mutableListOf<Streamable.Media>()
+        if (hasOgg && hasPremium()) {
+            track.file.forEach { file ->
+                val format = file.format ?: return@forEach
+                if (format.isOgg()) {
+                    media.add(
+                        oggStream(streamable.copy(id = file.fileId, extras = mapOf("gid" to track.toGid())))
+                    )
                 }
-
-                else -> pagedLibrary(queries, tab.id, null, cropCovers)
-            }.toFeedData()
+            }
         }
+        if (hasMp4) {
+            track.file.forEach { file ->
+                val format = file.format ?: return@forEach
+                if (format.isMp4()) {
+                    media.add(
+                        widevineStream(streamable.copy(id = file.fileId))
+                    )
+                }
+            }
+        }
+
+        return streamable.copy(media = media)
     }
 
-    override suspend fun saveToLibrary(item: EchoMediaItem, shouldSave: Boolean) {
-        if (api.cookie == null) throw ClientException.LoginRequired()
-        if (shouldSave) queries.addToLibrary(item.id)
-        else queries.removeFromLibrary(item.id)
+    override suspend fun loadTrack(track: Track): Track {
+        val id = track.id.substringAfter("spotify:track:")
+        return queries.trackInfo(id).json.toTrack(cropCovers)
     }
 
-    override suspend fun isItemSaved(item: EchoMediaItem): Boolean {
-        if (api.cookie == null) return false
-        val isSaved = queries.areEntitiesInLibrary(item.id)
-            .json.data?.lookup?.firstOrNull()?.data?.saved
-        return isSaved ?: false
+    override suspend fun loadAlbum(album: Album): Album {
+        val id = album.id.substringAfter("spotify:album:")
+        val res = queries.getAlbum(id)
+        return res.json.toAlbum(res.raw, cropCovers)
     }
 
-    override suspend fun likeItem(item: EchoMediaItem, shouldLike: Boolean) {
-        if (shouldLike) queries.addToLibrary(item.id)
-        else queries.removeFromLibrary(item.id)
+    override suspend fun loadPlaylist(playlist: Playlist): Playlist {
+        val id = playlist.id.substringAfter("spotify:playlist:")
+        return queries.getPlaylist(id).json.toPlaylist(cropCovers)
     }
 
-    override suspend fun isItemLiked(item: EchoMediaItem) = isItemSaved(item)
-
-    override suspend fun isFollowing(item: EchoMediaItem) = isItemSaved(item)
-
-    override suspend fun getFollowersCount(item: EchoMediaItem): Long? {
-        if (item !is Artist) return null
-        val type = item.id.substringAfter(":").substringBefore(":")
-        val id = item.id.substringAfter("spotify:$type:")
-        val req = Request.Builder().url("https://api.spotify.com/v1/${type}s/$id").build()
-        val json = api.run { json.decode<JsonObject>(callGetBody(req)) }
-        return json["followers"]?.jsonObject?.get("total")?.jsonPrimitive?.long
+    override suspend fun setLiked(item: EchoMediaItem, liked: Boolean) {
+        val id = item.id.substringAfter("spotify:track:")
+        if (liked) queries.like(id) else queries.unlike(id)
     }
 
-    override suspend fun followItem(item: EchoMediaItem, shouldFollow: Boolean) {
-        if (api.cookie == null) throw ClientException.LoginRequired()
-        when (val type = item.id.substringAfter(":").substringBefore(":")) {
+    override suspend fun setSaved(item: EchoMediaItem, saved: Boolean) {
+        val id = item.id.substringAfter("spotify:album:")
+        if (saved) queries.save(id) else queries.unsave(id)
+    }
+
+    override suspend fun setFollowing(artist: Artist, following: Boolean) {
+        when (val type = artist.id.substringAfter(":").substringBefore(":")) {
             "artist" -> {
-                if (shouldFollow) queries.addToLibrary(item.id)
-                else queries.removeFromLibrary(item.id)
+                val id = artist.id.substringAfter("spotify:artist:")
+                if (following) queries.followArtists(id)
+                else queries.unfollowArtists(id)
             }
 
             "user" -> {
-                val id = item.id.substringAfter("spotify:user:")
-                if (shouldFollow) queries.followUsers(id)
+                val id = artist.id.substringAfter("spotify:user:")
+                if (following) queries.followUsers(id)
                 else queries.unfollowUsers(id)
             }
 
@@ -676,14 +430,6 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
     val time = 5000L
     var lastFetched = 0L
     val mutex = Mutex()
-
-    open suspend fun getKey(accessToken: String, fileId: String): ByteArray {
-        // This is a fallback, but we need the gid to get the key from Mercury.
-        // If we don't have it, we might have to fetch metadata first.
-        // For now, let's assume the fileId is the gid if they are the same length, 
-        // or throw a better error.
-        throw Exception("Internal API: GID required for Mercury key request")
-    }
 
     private suspend fun oggStream(streamable: Streamable): Streamable.Media {
         val fileId = streamable.id

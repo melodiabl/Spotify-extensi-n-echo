@@ -5,7 +5,8 @@ plugins {
 
 dependencies {
     implementation(project(":ext"))
-    implementation(files("libs/unplayplay.aar"))
+    // implementation(files("libs/unplayplay.aar")) // Removed as it's a private dependency
+
     compileOnly(libs.echo.common)
     compileOnly(libs.kotlin.stdlib)
 }
@@ -21,7 +22,7 @@ kotlin {
 
 val extType: String by project
 val extId: String by project
-val extClass = "ADSpotifyExtension"
+val extClass = "SpotifyExtension"
 
 val extIconUrl: String? by project
 val extName: String by project
@@ -62,7 +63,7 @@ android {
     namespace = "dev.brahmkshatriya.echo.extension"
     compileSdk = 36
     defaultConfig {
-        applicationId = "dev.brahmkshatriya.echo.extension.$extId"
+        applicationId = "dev.brahmkshatriya.echo.extension.spotify"
         minSdk = 24
         targetSdk = 36
 

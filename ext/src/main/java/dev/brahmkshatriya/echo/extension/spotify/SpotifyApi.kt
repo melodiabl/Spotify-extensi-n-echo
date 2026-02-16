@@ -18,11 +18,11 @@ import okhttp3.internal.closeQuietly
 import java.io.File
 import java.net.URLEncoder
 
-class SpotifyApi(val filesDir: File) {
+class SpotifyApi(val filesDir: File, val clientId: String, val clientSecret: String) {
     val json = Json()
 
     private val webMutex = Mutex()
-    val web = TokenManagerWeb(this)
+    val web = TokenManagerWeb(this, clientId, clientSecret)
     private val appMutex = Mutex()
     val app = TokenManagerApp(this)
 
@@ -109,7 +109,7 @@ class SpotifyApi(val filesDir: File) {
             throw it
         }
         val response = call(request).body.string()
-        return if (response.startsWith('{')) response else {
+        return if (response.startsWith("{")) response else {
             throw Exception("Invalid response: $response")
         }
     }
